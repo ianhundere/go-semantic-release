@@ -84,6 +84,7 @@ func NewConfig(cmd *cobra.Command) (*Config, error) {
 		HooksPlugins:                          viper.GetStringSlice("plugins.hooks.names"),
 		HooksOpts:                             hoOpts,
 		UpdateFiles:                           mustGetStringArray(cmd, "update"),
+		UpdateFilesBefore:                     mustGetStringArray(cmd, "update-before"),
 		Match:                                 mustGetString(cmd, "match"),
 		VersionFile:                           mustGetBool(cmd, "version-file"),
 		Prerelease:                            mustGetBool(cmd, "prerelease"),
@@ -146,6 +147,7 @@ func SetFlags(cmd *cobra.Command) {
 	cmd.Flags().StringSlice("hooks", []string{}, "hooks plugin names")
 	cmd.Flags().StringArray("hooks-opt", []string{}, "options that are passed to the hooks plugins")
 	cmd.Flags().StringArrayP("update", "u", []string{}, "updates the version of a certain files")
+	cmd.Flags().StringArray("update-before", []string{}, "updates files before release creation (format: file:regex:template)")
 	cmd.Flags().String("match", "", "only consider tags matching the given glob(7) pattern, excluding the \"refs/tags/\" prefix.")
 	cmd.Flags().String("maintained-version", "", "set the maintained version as base for new releases")
 	cmd.Flags().BoolP("version-file", "f", false, "create a .version file with the new version")

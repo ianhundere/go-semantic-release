@@ -16,6 +16,7 @@ message CreateReleaseConfig {
   bool prerelease = 3;
   string branch = 4;
   string SHA = 5;
+  bool draft = 6;
 }
 
 message ProviderInit {

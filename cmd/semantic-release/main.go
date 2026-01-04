@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
 
@@ -76,6 +78,127 @@ func mergeConfigWithDefaults(defaults, conf map[string]string) {
 			}
 		}
 	}
+}
+
+func updateFilesBeforeRelease(patterns []string, version string) error {
+	v, err := semver.NewVersion(version)
+	if err != nil {
+		return fmt.Errorf("invalid version: %w", err)
+	}
+
+	replacements := map[string]string{
+		"{{version}}": version,
+		"{{major}}":   fmt.Sprintf("%d", v.Major()),
+		"{{minor}}":   fmt.Sprintf("%d", v.Minor()),
+		"{{patch}}":   fmt.Sprintf("%d", v.Patch()),
+	}
+
+	for _, pattern := range patterns {
+		parts := strings.SplitN(pattern, ":", 3)
+		if len(parts) != 3 {
+			return fmt.Errorf("invalid pattern format: %s (expected file:regex:template)", pattern)
+		}
+
+		file := strings.TrimSpace(parts[0])
+		regexStr := strings.TrimSpace(parts[1])
+		template := parts[2]
+		if file == "" || regexStr == "" {
+			return fmt.Errorf("invalid pattern format: %s (expected file:regex:template)", pattern)
+		}
+
+		for k, v := range replacements {
+			template = strings.ReplaceAll(template, k, v)
+		}
+
+		fi, err := os.Stat(file)
+		if err != nil {
+			return fmt.Errorf("failed to stat %s: %w", file, err)
+		}
+
+		content, err := os.ReadFile(file)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", file, err)
+		}
+
+		re, err := regexp.Compile(regexStr)
+		if err != nil {
+			return fmt.Errorf("invalid regex in pattern %s: %w", pattern, err)
+		}
+		if !re.Match(content) {
+			return fmt.Errorf("pattern did not match any content in %s (regex=%q)", file, regexStr)
+		}
+
+		oldContent := string(content)
+		newContent := re.ReplaceAllString(oldContent, template)
+		if newContent == oldContent {
+			logger.Printf("no changes for %s\n", file)
+			continue
+		}
+
+		if err := os.WriteFile(file, []byte(newContent), fi.Mode()); err != nil {
+			return fmt.Errorf("failed to write %s: %w", file, err)
+		}
+
+		logger.Printf("updated %s\n", file)
+	}
+
+	return nil
+}
+
+func commitAndPushChanges(files []string, message string, branch string) (string, error) {
+	branch = strings.TrimPrefix(branch, "refs/heads/")
+	branch = strings.TrimPrefix(branch, "origin/")
+	if branch == "" {
+		return "", fmt.Errorf("branch is empty")
+	}
+
+	cmd := exec.Command("git", "diff", "--cached", "--quiet")
+	if err := cmd.Run(); err != nil {
+		if _, ok := err.(*exec.ExitError); ok {
+			return "", fmt.Errorf("index has staged changes; refusing to commit update-before changes")
+		}
+		return "", fmt.Errorf("failed to check index state: %w", err)
+	}
+
+	for _, file := range files {
+		if strings.TrimSpace(file) == "" {
+			continue
+		}
+		cmd := exec.Command("git", "add", "--", file)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("git add failed: %s: %w", output, err)
+		}
+	}
+
+	cmd = exec.Command("git", "diff", "--cached", "--quiet")
+	if err := cmd.Run(); err == nil {
+		cmd = exec.Command("git", "rev-parse", "HEAD")
+		output, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("failed to get SHA: %w", err)
+		}
+		return strings.TrimSpace(string(output)), nil
+	} else if _, ok := err.(*exec.ExitError); !ok {
+		return "", fmt.Errorf("failed to check staged diff: %w", err)
+	}
+
+	cmd = exec.Command("git", "commit", "-m", message)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git commit failed: %s: %w", output, err)
+	}
+
+	cmd = exec.Command("git", "push", "origin", "HEAD:"+branch)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("git push failed: %s: %w", output, err)
+	}
+
+	cmd = exec.Command("git", "rev-parse", "HEAD")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to get new SHA: %w", err)
+	}
+
+	return strings.TrimSpace(string(output)), nil
 }
 
 //gocyclo:ignore
@@ -284,13 +407,60 @@ func cliHandler(cmd *cobra.Command, _ []string) {
 		exitIfError(errors.New("DRY RUN: no release was created"), 0)
 	}
 
-	logger.Println("creating release...")
+	// update files before release if specified
+	if len(conf.UpdateFilesBefore) > 0 {
+		logger.Println("updating files before release...")
+		if err := updateFilesBeforeRelease(conf.UpdateFilesBefore, newVer); err != nil {
+			exitIfError(err)
+		}
+
+		filesToCommit := make([]string, 0, len(conf.UpdateFilesBefore))
+		for _, pattern := range conf.UpdateFilesBefore {
+			parts := strings.SplitN(pattern, ":", 3)
+			if len(parts) == 3 {
+				filesToCommit = append(filesToCommit, strings.TrimSpace(parts[0]))
+			}
+		}
+
+		commitMsg := conf.FilesUpdaterOpts["commit-message"]
+		if commitMsg == "" {
+			commitMsg = fmt.Sprintf("chore: bump version to %s", newVer)
+		}
+		commitMsg = strings.ReplaceAll(commitMsg, "{{version}}", newVer)
+
+		logger.Println("committing and pushing changes...")
+		newSHA, err := commitAndPushChanges(filesToCommit, commitMsg, currentBranch)
+		if err != nil {
+			exitIfError(err)
+		}
+
+		currentSha = newSHA
+		logger.Printf("updated SHA to %s\n", currentSha)
+	}
+
+	draft := false
+	// only accept exact "true" string per spec - other values default to false
+	if draftOpt, ok := conf.ProviderOpts["draft"]; ok {
+		if draftOpt == "true" {
+			draft = true
+		} else {
+			logger.Printf("warning: draft option value '%s' is not 'true', defaulting to published release\n", draftOpt)
+		}
+	}
+
+	if draft {
+		logger.Println("creating draft release...")
+	} else {
+		logger.Println("creating published release...")
+	}
+
 	newRelease := &provider.CreateReleaseConfig{
 		Changelog:  changelogRes,
 		NewVersion: newVer,
 		Prerelease: conf.Prerelease,
 		Branch:     currentBranch,
 		SHA:        currentSha,
+		Draft:      draft,
 	}
 	exitIfError(prov.CreateRelease(newRelease))
 
